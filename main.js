@@ -53,8 +53,6 @@ directionalLight.shadow.camera.right = 15;
 directionalLight.shadow.camera.top = 15;
 directionalLight.shadow.camera.bottom = -15;
 scene.add(directionalLight);
-// const helper = new THREE.CameraHelper( directionalLight.shadow.camera );
-// scene.add( helper ); // Optional: Visualize shadow camera
 
 // Ground (optional, but helps with shadows)
 const groundGeometry = new THREE.PlaneGeometry(200, 200);
@@ -82,6 +80,10 @@ function getPlayerOffset(username) {
     // Use modulo to get somewhat distributed values within a range
     const xOffset = ((hash >> 16) % 21) - 10; // Range -10 to 10
     const zOffset = (hash % 21) - 10; // Range -10 to 10
+    // Ensure offset isn't exactly (0,0) to avoid collision with potential central elements
+    if (xOffset === 0 && zOffset === 0) {
+        return { x: 1.5 * STAIR_WIDTH, z: 0 }; // Default offset if hash results in zero
+    }
     return { x: xOffset * 1.5 * STAIR_WIDTH, z: zOffset * 1.5 * STAIR_DEPTH }; // Scale offsets
 }
 
@@ -89,31 +91,36 @@ function getPlayerOffset(username) {
 async function initMyClimbData() {
     try {
         const currentUser = await room.getCurrentUser();
+        if (!currentUser || !currentUser.username) {
+            console.error("Could not get current user info.");
+            document.getElementById('my-score').textContent = "Error loading user data";
+            return;
+        }
         myUsername = currentUser.username;
         console.log("Current user:", myUsername);
 
+        // Fetch existing data specifically for the user
         const existingData = room.collection(USER_STAIRS_COLLECTION).filter({ username: myUsername }).getList();
 
         if (existingData.length > 0) {
-            myClimbData = existingData[0];
+            myClimbData = existingData.sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
             console.log("Existing data found:", myClimbData);
         } else {
             console.log("Creating new climb data for", myUsername);
             myClimbData = await room.collection(USER_STAIRS_COLLECTION).create({ score: 0 });
+            if (!myClimbData) {
+                throw new Error("Failed to create climb data in database.");
+            }
             console.log("New data created:", myClimbData);
         }
 
-        if (myClimbData) {
-            myPlayerObject = await ensurePlayerObjects(myClimbData.username, myClimbData.score, true, myClimbData.id);
-            updateMyScoreDisplay();
-            updateCameraTarget(true); // Initial camera positioning
-        } else {
-            console.error("Failed to initialize or create user climb data.");
-            // Display an error message to the user?
-        }
+        myPlayerObject = await ensurePlayerObjects(myClimbData.username, myClimbData.score, true, myClimbData.id);
 
+        updateMyScoreDisplay();
+        updateCameraTarget(true); // Initial camera positioning
     } catch (error) {
         console.error("Error initializing user data:", error);
+        document.getElementById('my-score').textContent = "Error initializing";
     }
 }
 
@@ -122,16 +129,18 @@ room.collection(USER_STAIRS_COLLECTION).subscribe((allClimbData) => {
     const leaderboardList = document.getElementById('leaderboard-list');
     leaderboardList.innerHTML = ''; // Clear previous entries
 
-    // Sort by score descending
     allClimbData.sort((a, b) => b.score - a.score);
 
     const currentPlayersUsernames = new Set();
 
-    // Process updates and add to leaderboard
     allClimbData.forEach(data => {
+        if (!data || typeof data.username !== 'string' || typeof data.score !== 'number') {
+            console.warn("Received invalid climb data:", data);
+            return;
+        }
+
         currentPlayersUsernames.add(data.username);
 
-        // Update Leaderboard UI
         const li = document.createElement('li');
         const avatar = document.createElement('img');
         avatar.src = `https://images.websim.ai/avatar/${data.username}`;
@@ -145,31 +154,35 @@ room.collection(USER_STAIRS_COLLECTION).subscribe((allClimbData) => {
         li.appendChild(scoreSpan);
         leaderboardList.appendChild(li);
 
-        // Update or create 3D representation for other players
-        if (data.username !== myUsername) {
-            ensurePlayerObjects(data.username, data.score, false, data.id).then(playerData => {
-                if (playerData && playerData.score !== data.score) { // Only update if score changed
-                    updatePlayerPosition(playerData, data.score); // Update position smoothly later if needed
-                    ensureStairs(playerData); // Update stairs
-                    playerData.score = data.score; // Update local score cache
-                }
-                if (playerData) playerData.lastUpdate = Date.now();
-            });
-        } else {
-            // Update my own score if it changed unexpectedly (e.g., concurrent sessions)
-            if (myClimbData && myPlayerObject && myClimbData.id === data.id && myClimbData.score !== data.score) {
+        if (data.username === myUsername) {
+            if (myPlayerObject && myClimbData && myClimbData.id === data.id && myClimbData.score !== data.score) {
                 console.log("My score changed externally:", myClimbData.score, "->", data.score);
-                myClimbData.score = data.score;
-                myPlayerObject.score = data.score;
-                updatePlayerPosition(myPlayerObject, myClimbData.score); // Update my position
-                ensureStairs(myPlayerObject); // Update my stairs
-                updateMyScoreDisplay();
+                if (!myPlayerObject.isBouncing) {
+                    myClimbData.score = data.score;
+                    myPlayerObject.score = data.score;
+                    updatePlayerPosition(myPlayerObject, myClimbData.score); // Update my position
+                    ensureStairs(myPlayerObject); // Update my stairs
+                    updateMyScoreDisplay();
+                } else {
+                    console.log("Skipping external update during bounce animation.");
+                }
+            }
+            if (myPlayerObject && myPlayerObject.username !== myUsername) {
+                console.warn("myPlayerObject reference mismatch!");
+                myPlayerObject = otherPlayersData[myUsername]; // Try to re-assign
             }
             if (myPlayerObject) myPlayerObject.lastUpdate = Date.now();
+        } else {
+            ensurePlayerObjects(data.username, data.score, false, data.id).then(playerData => {
+                if (playerData && playerData.score !== data.score) {
+                    updatePlayerPosition(playerData, data.score); // Update position
+                    ensureStairs(playerData); // Update stairs
+                }
+                if (playerData) playerData.lastUpdate = Date.now();
+            }).catch(err => console.error(`Error ensuring objects for ${data.username}:`, err));
         }
     });
 
-    // Remove players who are no longer in the data
     for (const username in otherPlayersData) {
         if (!currentPlayersUsernames.has(username) && username !== myUsername) {
             removePlayer(username);
@@ -187,7 +200,6 @@ function createPlayerMaterial(username) {
         hash = ((hash << 5) - hash) + char;
         hash |= 0; // Convert to 32bit integer
     }
-    // Generate a color with decent saturation and brightness
     const hue = (hash % 360 + 360) % 360; // Ensure positive hue
     const saturation = 0.6 + (hash % 40) / 100; // 0.6 - 1.0
     const lightness = 0.5 + (hash % 20) / 100; // 0.5 - 0.7
@@ -198,6 +210,7 @@ function createPlayerMaterial(username) {
 
 async function ensurePlayerObjects(username, score, isMe = false, recordId) {
     if (!otherPlayersData[username]) {
+        console.log(`Creating objects for ${isMe ? 'myself' : 'other player'}: ${username}`);
         const playerMaterial = createPlayerMaterial(username);
         const playerMesh = new THREE.Mesh(playerGeometry, playerMaterial);
         playerMesh.castShadow = true;
@@ -209,7 +222,6 @@ async function ensurePlayerObjects(username, score, isMe = false, recordId) {
         playerMesh.position.set(offset.x, initialY, offset.z);
         scene.add(playerMesh);
 
-        // Create a group for this player's stairs
         const stairsGroup = new THREE.Group();
         scene.add(stairsGroup);
 
@@ -222,51 +234,63 @@ async function ensurePlayerObjects(username, score, isMe = false, recordId) {
             isMe: isMe,
             stairsGroup: stairsGroup,
             renderedStairIndices: new Set(),
-            isBouncing: false, // Add bounce state per player
+            isBouncing: false,
             lastUpdate: Date.now()
         };
-        console.log(`Created objects for ${username}`, otherPlayersData[username]);
         ensureStairs(otherPlayersData[username]); // Create initial stairs
         return otherPlayersData[username];
     } else {
-        // Ensure existing data is up-to-date, especially if score changed before subscribe update
         const playerData = otherPlayersData[username];
-        if (playerData.score !== score) {
-            updatePlayerPosition(playerData, score);
-            ensureStairs(playerData);
-            playerData.score = score;
+        if (playerData.id !== recordId) {
+            console.warn(`Record ID changed for ${username}: ${playerData.id} -> ${recordId}`);
+            playerData.id = recordId;
         }
-        playerData.lastUpdate = Date.now(); // Mark as recently updated
+        playerData.lastUpdate = Date.now(); // Mark as recently updated/seen
         return playerData;
     }
 }
 
 function removePlayer(username) {
     const playerData = otherPlayersData[username];
-    if (playerData) {
+    if (playerData && !playerData.isMe) {
         console.log(`Removing player ${username}`);
-        if (playerData.mesh) scene.remove(playerData.mesh);
-        if (playerData.stairsGroup) scene.remove(playerData.stairsGroup); // Remove all stairs at once
+        if (playerData.mesh) {
+            scene.remove(playerData.mesh);
+            playerData.mesh.geometry.dispose(); // Cleanup geometry
+            playerData.mesh.material.dispose(); // Cleanup material
+        }
+        if (playerData.stairsGroup) {
+            playerData.stairsGroup.children.forEach(stair => {
+                if (stair instanceof THREE.Mesh) {
+                    if (stair.geometry) stair.geometry.dispose();
+                    if (stair.material) stair.material.dispose();
+                }
+            });
+            scene.remove(playerData.stairsGroup); // Remove all stairs at once
+        }
         delete otherPlayersData[username];
+    } else if (playerData && playerData.isMe) {
+        console.warn("Attempted to remove own player object:", username);
     }
 }
 
 function updatePlayerPosition(playerData, newScore) {
-    if (!playerData || !playerData.mesh) return;
+    if (!playerData || !playerData.mesh) {
+        console.warn("Attempted to update position for invalid player data:", playerData);
+        return;
+    }
 
     const targetY = newScore * STAIR_HEIGHT;
-    const currentY = playerData.mesh.position.y;
 
-    // If it's not me and the change is significant, maybe add a small animation?
-    // For now, directly set position for others, animate for self via climb()
     if (!playerData.isMe) {
         playerData.mesh.position.y = targetY;
+    } else if (!playerData.isBouncing) {
+        playerData.mesh.position.y = targetY;
     }
-    // Ensure X/Z are correct (shouldn't change, but good practice)
+
     playerData.mesh.position.x = playerData.offset.x;
     playerData.mesh.position.z = playerData.offset.z;
 
-    // Update score in the local cache
     playerData.score = newScore;
 }
 
@@ -282,8 +306,8 @@ function updateCameraTarget(immediate = false) {
     if (immediate) {
         controls.target.copy(targetPosition);
         camera.position.copy(targetPosition).add(CAMERA_OFFSET);
+        controls.update(); // Update controls immediately after setting target/position
     } else {
-        // Smoothly interpolate controls target
         controls.target.lerp(targetPosition, 0.1); // Adjust lerp factor for desired smoothness
     }
 }
@@ -293,157 +317,215 @@ const stairGeometry = new THREE.BoxGeometry(STAIR_WIDTH, STAIR_HEIGHT, STAIR_DEP
 const stairMaterial = new THREE.MeshStandardMaterial({ color: 0xaaaaaa, roughness: 0.8 });
 
 function ensureStairs(playerData) {
-    if (!playerData || !playerData.stairsGroup) return;
+    if (!playerData || !playerData.stairsGroup || !playerData.offset) {
+        console.warn("ensureStairs called with invalid playerData:", playerData);
+        return;
+    }
 
     const { score, offset, stairsGroup, renderedStairIndices } = playerData;
-    const targetStairCount = score + 1; // Need stair 0 up to stair 'score'
+    const currentScore = Math.max(0, Math.floor(score));
+    const targetStairCount = currentScore + 1; // Need stair 0 up to stair 'currentScore'
 
-    // Add missing stairs
-    for (let i = 0; i < targetStairCount; i++) {
-        // Optimization: Only render stairs 'near' the player's current score
-        if (i < score - MAX_STAIRS_PER_PLAYER_VISIBLE) {
-            continue;
-        };
-
+    for (let i = Math.max(0, currentScore - MAX_STAIRS_PER_PLAYER_VISIBLE - 1); i < targetStairCount; i++) {
         if (!renderedStairIndices.has(i)) {
-            const stair = new THREE.Mesh(stairGeometry, stairMaterial.clone()); // Clone material if changing properties per stair
+            const stair = new THREE.Mesh(stairGeometry, stairMaterial); // Use shared material
             stair.position.set(offset.x, i * STAIR_HEIGHT - (STAIR_HEIGHT / 2), offset.z); // Center stair vertically
             stair.castShadow = true;
             stair.receiveShadow = true;
+            stair.userData.stairIndex = i; // Store index for potential removal
             stairsGroup.add(stair);
             renderedStairIndices.add(i);
-            stair.userData.stairIndex = i; // Store index for potential removal
         }
     }
 
-    // Optimization: Remove stairs far below the player
     const stairsToRemove = [];
-    for (const stair of stairsGroup.children) {
-        if (stair.userData.stairIndex < score - MAX_STAIRS_PER_PLAYER_VISIBLE - 10) { // Add buffer before removing
+    stairsGroup.children.forEach(stair => {
+        if (stair.userData.stairIndex === undefined || stair.userData.stairIndex < currentScore - MAX_STAIRS_PER_PLAYER_VISIBLE - 10) {
             stairsToRemove.push(stair);
-            renderedStairIndices.delete(stair.userData.stairIndex);
+            if (stair.userData.stairIndex !== undefined) {
+                renderedStairIndices.delete(stair.userData.stairIndex);
+            }
         }
-    };
-    stairsToRemove.forEach(stair => stairsGroup.remove(stair));
+    });
 
+    stairsToRemove.forEach(stair => {
+        stairsGroup.remove(stair);
+    });
 }
 
 // --- Game Logic ---
-async function climb() {
-    if (!myClimbData || !myPlayerObject || myPlayerObject.isBouncing) return;
+let isClimbing = false;
 
-    myPlayerObject.isBouncing = true;
+async function climb() {
+    if (isClimbing || !myClimbData || !myPlayerObject || myPlayerObject.isBouncing) {
+        console.log("Climb blocked:", { isClimbing, myClimbData, myPlayerObject, isBouncing: myPlayerObject?.isBouncing });
+        return;
+    }
+
+    if (!myPlayerObject.mesh || !myPlayerObject.stairsGroup) {
+        console.error("Climb attempt with invalid player object references:", myPlayerObject);
+        return;
+    }
+
+    isClimbing = true;
+
     const previousScore = myClimbData.score;
     const newScore = previousScore + 1;
 
-    // Optimistic UI update
-    myClimbData.score = newScore; // Update local authoritative state
-    myPlayerObject.score = newScore; // Update local display/cache state
+    myClimbData.score = newScore;
+    myPlayerObject.score = newScore;
     ensureStairs(myPlayerObject); // Add the new stair immediately
     updateMyScoreDisplay();
+    myPlayerObject.isBouncing = true;
 
-    // Bounce animation
     const playerMesh = myPlayerObject.mesh;
-    const startY = previousScore * STAIR_HEIGHT;
+    const startY = playerMesh.position.y; // Use current mesh Y as start, might not be exactly previousScore height if interrupted
     const peakY = newScore * STAIR_HEIGHT + BOUNCE_HEIGHT;
     const endY = newScore * STAIR_HEIGHT;
     const startTime = Date.now();
 
     function bounceStep() {
+        if (!myPlayerObject || !myPlayerObject.isBouncing) {
+            console.log("Bounce cancelled.");
+            isClimbing = false;
+            return;
+        }
         const elapsed = Date.now() - startTime;
         const progress = Math.min(elapsed / BOUNCE_DURATION, 1);
         let currentY;
 
-        // Ease-out for up, ease-in for down (quadratic easing)
         if (progress < 0.5) {
-            const t = progress * 2; // Normalize to 0-1 for ascent
-            currentY = startY + (peakY - startY) * (1 - (1 - t) * (1 - t));
+            const t = progress * 2; // Normalize to 0-1 for ascent phase
+            currentY = startY + (peakY - startY) * (1 - (1 - t) * (1 - t)); // Ease out
         } else {
-            const t = (progress - 0.5) * 2; // Normalize to 0-1 for descent
-            currentY = peakY - (peakY - endY) * t * t;
+            const t = (progress - 0.5) * 2; // Normalize to 0-1 for descent phase
+            currentY = peakY - (peakY - endY) * t * t; // Ease in
         }
 
-        playerMesh.position.y = currentY;
+        if (playerMesh && playerMesh.parent) {
+            playerMesh.position.y = currentY;
+        } else {
+            console.warn("Player mesh removed during bounce animation.");
+            myPlayerObject.isBouncing = false;
+            isClimbing = false;
+            return;
+        }
 
         if (progress < 1) {
             requestAnimationFrame(bounceStep);
         } else {
-            playerMesh.position.y = endY; // Ensure final position
+            if (playerMesh && playerMesh.parent) {
+                playerMesh.position.y = endY;
+            }
             myPlayerObject.isBouncing = false;
         }
     }
     requestAnimationFrame(bounceStep);
 
-    // Persist the change to the database
     try {
-        // console.log("Updating score to:", newScore, "for ID:", myClimbData.id);
-        await room.collection(USER_STAIRS_COLLECTION).update(myClimbData.id, { score: newScore });
-        // console.log("Score updated successfully");
+        const updateResult = await room.collection(USER_STAIRS_COLLECTION).update(myClimbData.id, { score: newScore });
+        if (!updateResult) {
+            throw new Error("Database update failed or returned falsy.");
+        }
     } catch (error) {
         console.error("Error updating score:", error);
-        // Revert optimistic update
         myClimbData.score = previousScore;
-        myPlayerObject.score = previousScore;
-        updatePlayerPosition(myPlayerObject, previousScore); // Revert position visually (snap back)
+        if (myPlayerObject && myPlayerObject.score === newScore) {
+            myPlayerObject.score = previousScore;
+            if (!myPlayerObject.isBouncing && playerMesh && playerMesh.parent) {
+                playerMesh.position.y = previousScore * STAIR_HEIGHT;
+            }
+            ensureStairs(myPlayerObject);
+        }
         updateMyScoreDisplay();
-        myPlayerObject.isBouncing = false; // Allow trying again
-        // Maybe remove the optimistically added stair? Or leave it for simplicity.
+        myPlayerObject.isBouncing = false;
+    } finally {
+        isClimbing = false;
     }
 }
 
 function updateMyScoreDisplay() {
+    const scoreElement = document.getElementById('my-score');
     if (myClimbData) {
-        document.getElementById('my-score').textContent = `My Score: ${myClimbData.score}`;
+        scoreElement.textContent = `My Score: ${myClimbData.score}`;
+    } else {
+        scoreElement.textContent = `My Score: Loading...`;
     }
 }
 
-// Event Listener for climbing
 window.addEventListener('keydown', (event) => {
-    if (event.code === 'Space' && !event.repeat) { // Prevent holding space
-        event.preventDefault(); // Prevent page scrolling
+    if (document.activeElement && (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA')) {
+        return;
+    }
+
+    if (event.code === 'Space' && !event.repeat) {
+        event.preventDefault();
         climb();
     }
 });
 
-// --- Animation Loop ---
-const clock = new THREE.Clock(); // For timing if needed
+const clock = new THREE.Clock();
+
 function animate() {
     requestAnimationFrame(animate);
 
-    const delta = clock.getDelta(); // Get time delta for smooth animations if needed later
+    const delta = clock.getDelta();
 
-    controls.update(); // Required for damping
+    if (myPlayerObject && (!controls.manualZoom || !controls.manualRotate || !controls.manualPan)) {
+        updateCameraTarget();
+    }
 
-    // Update camera to follow player smoothly
-    updateCameraTarget();
+    controls.update();
 
     renderer.render(scene, camera);
 }
 
-// --- Initialization ---
 initMyClimbData().then(() => {
     console.log("Initialization complete.");
-    animate(); // Start the rendering loop only after user data is ready
+    if (myUsername) {
+        animate();
+    } else {
+        console.error("Initialization finished but user data is missing. Cannot start animation loop.");
+        const errorDiv = document.createElement('div');
+        errorDiv.style.position = 'absolute';
+        errorDiv.style.top = '50%';
+        errorDiv.style.left = '50%';
+        errorDiv.style.transform = 'translate(-50%, -50%)';
+        errorDiv.style.padding = '20px';
+        errorDiv.style.backgroundColor = 'rgba(255, 0, 0, 0.7)';
+        errorDiv.style.color = 'white';
+        errorDiv.style.borderRadius = '5px';
+        errorDiv.textContent = 'Failed to load user data. Please refresh the page.';
+        document.body.appendChild(errorDiv);
+    }
 }).catch(err => {
     console.error("Initialization failed:", err);
-    // Show error to user? Fallback?
+    const errorDiv = document.createElement('div');
+    errorDiv.style.position = 'absolute';
+    errorDiv.style.top = '50%';
+    errorDiv.style.left = '50%';
+    errorDiv.style.transform = 'translate(-50%, -50%)';
+    errorDiv.style.padding = '20px';
+    errorDiv.style.backgroundColor = 'rgba(255, 0, 0, 0.7)';
+    errorDiv.style.color = 'white';
+    errorDiv.style.borderRadius = '5px';
+    errorDiv.textContent = 'An error occurred during initialization. Please refresh.';
+    document.body.appendChild(errorDiv);
 });
 
-// Handle window resizing
 window.addEventListener('resize', () => {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-// Optional: Cleanup inactive players periodically (e.g., if they haven't updated in 5 minutes)
 setInterval(() => {
     const now = Date.now();
-    const timeout = 5 * 60 * 1000; // 5 minutes
+    const timeout = 5 * 60 * 1000;
     for (const username in otherPlayersData) {
-        if (!otherPlayersData[username].isMe && now - otherPlayersData[username].lastUpdate > timeout) {
-            console.log(`Removing inactive player ${username}`);
+        if (!otherPlayersData[username].isMe && now - (otherPlayersData[username].lastUpdate || 0) > timeout) {
+            console.log(`Removing inactive player ${username} (last update: ${otherPlayersData[username].lastUpdate})`);
             removePlayer(username);
         }
     }
-}, 60 * 1000); // Check every minute
+}, 60 * 1000);
