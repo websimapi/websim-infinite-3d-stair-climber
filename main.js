@@ -301,7 +301,9 @@ function ensureStairs(playerData) {
     // Add missing stairs
     for (let i = 0; i < targetStairCount; i++) {
         // Optimization: Only render stairs 'near' the player's current score
-        if (i < score - MAX_STAIRS_PER_PLAYER_VISIBLE) continue;
+        if (i < score - MAX_STAIRS_PER_PLAYER_VISIBLE) {
+            continue;
+        };
 
         if (!renderedStairIndices.has(i)) {
             const stair = new THREE.Mesh(stairGeometry, stairMaterial.clone()); // Clone material if changing properties per stair
@@ -321,7 +323,7 @@ function ensureStairs(playerData) {
             stairsToRemove.push(stair);
             renderedStairIndices.delete(stair.userData.stairIndex);
         }
-    }
+    };
     stairsToRemove.forEach(stair => stairsGroup.remove(stair));
 
 }
